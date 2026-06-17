@@ -31,23 +31,78 @@ export default class TextProlog extends AntlrExtractor {
 
 class TextPrologVisitor extends withExtractor(prologVisitor) {
     #emittedPredicates = new Set<string>();
+    #bodyHead: string | null = null;
 
     visitClause = (ctx: any): null => {
         if (this.inBody) return null;
         const term = ctx.term?.();
         if (!term) return null;
-        const head = clauseHead(term);
-        if (!head) return null;
-        const pred = extractPredicate(head);
-        if (!pred) return null;
-        const key = `${pred.name}/${pred.arity}`;
-        if (this.#emittedPredicates.has(key)) return null;
-        this.#emittedPredicates.add(key);
-        this.addSymbol("function", pred.name, ctx, pred.params);
+        const pred = extractPredicate(clauseHead(term));
+        if (pred) {
+            const key = `${pred.name}/${pred.arity}`;
+            if (!this.#emittedPredicates.has(key)) {
+                this.#emittedPredicates.add(key);
+                this.addSymbol("function", pred.name, ctx, pred.params);
+            }
+        }
+        // A rule's BODY is a call graph: each body goal invokes a predicate.
+        // Scope those `call` refs under the head predicate name so the edge's
+        // container is the defining clause (SPEC §16 — container = enclosing
+        // def, the @> join key). Refs resolve to head-predicate DEFINITIONS in
+        // the same entry; built-ins (is, write, member, …) are honest dead rows.
+        const body = clauseBody(term);
+        if (body && pred) {
+            this.#bodyHead = pred.name;
+            // gateContainer pushes the head name as the ref container and visits
+            // CHILDREN; wrap the body so it is visited as a child (a single-goal
+            // body is a Compound/Atom term whose own children aren't goals).
+            this.gateContainer(pred.name, { getChildCount: () => 1, getChild: () => body } as any);
+            this.#bodyHead = null;
+        }
         return null;
     };
 
     visitDirective = (_ctx: any): null => null;
+
+    // Inside a gated body (gateContainer pushed the head predicate name), a
+    // compound goal `name(args)` is a `call` to that predicate. We do NOT
+    // recurse into its argument termlist: a goal riding in a meta-call argument
+    // (findall(X, p(X), L)) is a term, not structurally a goal, and classifying
+    // it needs meta-predicate knowledge we don't have. Precision over recall.
+    visitCompound_term = (ctx: any): null => {
+        if (this.#bodyHead === null) return null;
+        const name = atomName(ctx.atom?.());
+        if (name) this.addRef("call", name, ctx);
+        return null;
+    };
+
+    // A bare atom in goal position (nl, true, !) is a 0-arity call. Skip the
+    // cut `!` and control atoms — they're operators, not predicate calls.
+    visitAtom_term = (ctx: any): null => {
+        if (this.#bodyHead === null) return null;
+        const name = atomName(ctx.atom?.());
+        if (name && !CONTROL_ATOMS.has(name)) this.addRef("call", name, ctx);
+        return null;
+    };
+
+    // Binary operators in body position are control combinators (`,` `;` `->`)
+    // we descend through, or operator goals (X is E, X \= Y) we drop — a builtin
+    // operator predicate is not a named-predicate call.
+    visitBinary_operator = (ctx: any): null => {
+        if (this.#bodyHead === null) return null;
+        const op = ctx.operator_?.()?.getText?.();
+        if (CONTROL_OPERATORS.has(op)) {
+            for (const side of asArray(ctx.term?.())) this.visit(side as any);
+        }
+        return null;
+    };
+}
+
+const CONTROL_OPERATORS = new Set([",", ";", "->", "*->", "|"]);
+const CONTROL_ATOMS = new Set(["!", "true", "fail", "false"]);
+
+function asArray(raw: unknown): unknown[] {
+    return Array.isArray(raw) ? raw : raw ? [raw] : [];
 }
 
 // For rules `head :- body`, head is the LHS of a binary_operator term
@@ -67,6 +122,24 @@ function clauseHead(term: unknown): unknown {
         }
     }
     return term;
+}
+
+// For rules `head :- body` / DCG `head --> body`, the body is the RHS of the
+// binary operator. Facts have no body.
+function clauseBody(term: unknown): unknown {
+    const t = term as {
+        constructor?: { name?: string };
+        term?: () => Array<unknown> | unknown;
+        operator_?: () => { getText?: () => string } | null;
+    };
+    if (t.constructor?.name === "Binary_operatorContext") {
+        const op = t.operator_?.()?.getText?.();
+        if (op === ":-" || op === "-->") {
+            const arr = asArray(t.term?.());
+            return arr[1] ?? null;
+        }
+    }
+    return null;
 }
 
 function extractPredicate(head: unknown): { name: string; arity: number; params: string[] } | null {
